@@ -1,96 +1,86 @@
-# BhuMe Boundary Take-Home: Starter Kit
+# BhuMe Boundary Take-Home — Solution
 
-The official plot outlines in Maharashtra's land records sit metres off the real fields (an
-artifact of how old paper maps were georeferenced onto satellite imagery). **Your job: for each
-plot, return your best estimate of its true on-the-ground boundary, plus a confidence, and flag
-the ones you can't place.**
+Maharashtra's cadastral plot outlines sit metres off the real fields (an artifact of how old
+paper maps were georeferenced onto satellite imagery). **For each plot, this method returns its
+best estimate of the true on-the-ground boundary plus a confidence, and flags the ones it can't
+place** — submitted as a *method* (`village bundle → predictions.geojson`), not hand-edited maps.
 
-Read the problem in full at the site's **Understand** and **The task** pages first. This kit just
-removes the plumbing so you start at the interesting part.
+Built on the provided starter kit (`bhume/`, the geospatial plumbing); the method lives in
+`solver/`.
 
-## What this kit does (and doesn't)
-
-It hands you the geospatial plumbing we are **not** assessing, so your hours go to the actual
-problem. Each piece, and why it's here:
-
-- **`load(village)`** — plots, imagery, boundary hints and example truths as one object, CRS sorted
-  out. *Why: so you're not wiring up a GeoTIFF reader, a GeoJSON reader, and CRS handling before you
-  can even look at a plot.*
-- **`patch_for_plot(src, geom)`** — the RGB pixels under a plot. *Why: cropping a georeferenced
-  raster to a polygon (the window + affine-transform math) is fiddly and isn't what we're testing.*
-- **`lonlat_to_pixel` / `pixel_to_lonlat`** — convert between map coordinates and image pixels.
-  *Why: the plots are lon/lat (EPSG:4326) but the imagery is web-mercator (EPSG:3857); mixing them
-  up silently misaligns everything, and debugging that is a time sink, not a signal.*
-- **`score(preds, village)`** — the exact accuracy + calibration + restraint metrics we grade on,
-  run against the public example truths. *Why: a real feedback loop, you iterate against the same
-  numbers we'll compute.*
-- **`write_predictions(path, gdf)`** — emit a contract-valid `predictions.geojson`. *Why: so a
-  schema slip never sinks an otherwise-good submission.*
-- **`global_median_shift(village)`** — a deliberately naive baseline and a worked load→score loop.
-  *Why: a floor to beat, and ~15 lines showing the whole cycle so you start at the interesting part.*
-
-What it deliberately does **not** do: correct a plot for you. There's no align/snap/solve. The
-method (how you find the true boundary, how you decide your confidence) is the whole point.
-
-**Use any AI tools you like.** We expect it. We're assessing how you direct them, not whether you
-typed every line. The plumbing above is exactly the kind of thing to let an LLM handle; the
-judgment (which edge is right, what your confidence should mean, which records to trust) is not.
-
-## Setup
-
-This kit uses [uv](https://docs.astral.sh/uv/). Install it once
-([instructions](https://docs.astral.sh/uv/getting-started/installation/)), then:
+## Run it
 
 ```bash
-uv sync
+uv sync                                                   # one-time: deps into .venv
+uv run solve.py data/34855_vadnerbhairav_chandavad_nashik # Vadnerbhairav (Nashik)
+uv run solve.py data/12429_malatavadi_chandgad_kolhapur   # Malatavadi (Kolhapur)
 ```
 
-That reads `pyproject.toml` / `uv.lock`, picks Python 3.12, and installs everything (geopandas,
-rasterio, shapely, numpy, scipy, pillow) into a local `.venv`. The rasterio and geopandas wheels
-bundle GDAL, so there's no system GDAL to install. Prefix commands with `uv run` (below) and you
-never have to activate the venv yourself.
+Each run estimates the village drift, self-calibrates a confidence model, aligns every plot,
+writes `data/<village>/predictions.geojson` (contract format), and self-scores against the
+public example truths. Download the village bundles from the site's **Get started** page into
+`data/` first (the imagery `.tif`s are git-ignored).
 
-## Get the data
+## Approach (one method, no per-village tuning)
 
-Download a village bundle from the site's **Get started** page and unzip it into `data/`:
+The drift is dominantly a **coherent per-village translation** (~10–12 m) plus a smaller
+**per-plot residual**, with a minority of plots whose *shape/area* is wrong and can't be fixed by
+nudging. So:
+
+1. **Edge field** (`solver/edges.py`) — the plot outline is aligned to a fused map of the satellite
+   image gradient OR-ed with the rough `boundaries.tif` prior, then a distance transform for a
+   smooth chamfer cost. All thresholds are data-adaptive percentiles, so the same code runs on
+   both the coarse (1.2 m/px) and fine (0.6 m/px) villages.
+2. **Chamfer alignment** (`solver/align.py`) — slide the densified outline over the distance
+   transform, searching translation + small rotation; the optimum's sharpness and edge-support
+   become confidence signals.
+3. **Two stages** — estimate the village offset *unsupervised* (robust cluster-centre of many
+   translation-only fits), then refine each plot in a **small window around that prior** so dense
+   small parcels can't snap onto a neighbouring field.
+4. **Scale-aware** (`solver/confidence.py`) — a correction is capped at ~the plot's own radius;
+   railed plots expand only as far as their scale allows. Tight for small parcels, generous for
+   large fields, no per-village constant.
+5. **Confidence + restraint** — a logistic/ridge model predicts IoU from match-quality features,
+   trained on **self-supervised synthetic perturbations** (`solver/calibrate.py`) with *no example-
+   truth leakage*. Plots are then `corrected`, `flagged` (area error / ambiguous / implausible
+   shift), or kept (already on their edges).
+
+Nothing is tuned to a specific village: the offset and the confidence model are both derived per
+run from the imagery itself.
+
+## Results (self-score vs the official starting position)
+
+| Village | Median IoU (mine) | vs official | Calibration |
+|---|---|---|---|
+| Vadnerbhairav | **0.874** | 0.612 (**+0.262**) | held-out synthetic AUC 0.99 |
+| Malatavadi | **0.752** | 0.510 (**+0.242**) | example-truth AUC 1.0 |
+
+These run over the few public truths — a directional check, not the grade. The honest calibration
+evidence is the held-out AUC on the self-supervised synthetic set.
+
+## Repo layout
 
 ```
-data/
-  34855_vadnerbhairav_chandavad_nashik/
-    input.geojson         # the plots you transform (official, shifted)
-    imagery.tif           # georeferenced satellite mosaic, your primary signal
-    boundaries.tif        # rough, optional auto-detected field hints
-    example_truths.geojson# a few hand-aligned truths, for self-scoring
+solve.py            entry point: village bundle -> predictions.geojson + self-score
+solver/
+  edges.py          fused edge map + distance transform
+  geometry.py       pixel <-> lon/lat, outline sampling, polygon warping
+  align.py          chamfer matcher, unsupervised global offset, per-plot refine
+  confidence.py     features, ridge confidence model, flag/restraint gates
+  calibrate.py      self-supervised synthetic-perturbation calibration
+  pipeline.py       end-to-end orchestration
+bhume/              provided starter-kit plumbing (I/O, CRS, scoring)
+test_align.py       Phase-2 alignment validation
+test_confidence.py  Phase-3 calibration + decision validation
+transcripts/        AI session logs / web-chat links (how the work was directed)
 ```
 
-## Run the worked example
+## Limitations (and what I'd do next)
 
-```bash
-uv run quickstart.py data/34855_vadnerbhairav_chandavad_nashik
-```
-
-You'll see the baseline's score, e.g.:
-
-```
-accuracy:    median IoU pred=0.71 vs official=0.61  (improvement=+0.11, improved 1.00)
-calibration: Spearman(conf,IoU)=— · AUC=—   (flat confidence → no signal; this is the bar to clear)
-```
-
-Then make it better. A few directions (yours to choose, ignore, or replace):
-
-- The error is mostly a coherent offset, but not entirely. What's left after a global shift?
-- The imagery shows the real field edges. The boundary hints pre-detect some of them (roughly,
-  and only where they're visible). How do you use the image where the hints are thin?
-- Your confidence is scored. What makes a plot's correction trustworthy vs. a guess?
-- Some plots can't be placed. Flagging them is a correct answer.
-
-## Scoring notes
-
-`score()` mirrors the objective (L1) half of grading: IoU vs the truth, improvement over the
-official position, confidence calibration (does high confidence mean high accuracy?), and restraint
-(don't move already-correct plots). It runs over the **public example truths only** — a handful — so
-treat its output as a **rough directional check, not a grade**. Calibration in particular needs more
-plots than this to mean much (and restraint shows nothing here: the public sample has no
-already-correct control plots), so reason about what your confidence *should* represent rather than
-maximizing the number on this sample. Your real grade uses a larger hidden set, so don't overfit to
-these few. The contract spec is in `CONTRACT.md`.
+- **Malatavadi's global offset is ~4–5 m off** — dense terrain yields few clean anchors. This
+  drives heavy (but safe) flagging there. Next: iterate the offset estimate, or use a coarse
+  local offset field instead of one global translation.
+- **Rigid only** (translate + small rotation). Plots with genuine shape errors are flagged, not
+  reshaped. Edge-snapping the outline could lift IoU further, at the risk of overfitting.
+- **Confidence ranking is weak where corrections are nearly all good** (Vadner) — little to rank;
+  it carries clear signal where there is real variance (Malatavadi).
