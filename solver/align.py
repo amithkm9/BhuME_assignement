@@ -36,8 +36,19 @@ class AlignResult:
     margin: float                 # 2nd-best-basin separation, normalised
     edge_support: float           # fraction of outline points landing on an edge
     shift_m: float                # magnitude of the chosen translation, in metres
+    cost_orig: float              # chamfer cost at the official position (do-nothing)
+    railed: bool                  # optimum hit the search-window boundary (no interior min)
     n_points: int = 0
     surface: np.ndarray = field(default=None, repr=False)
+
+    @property
+    def improvement_ratio(self) -> float:
+        """How much moving reduced the chamfer cost vs doing nothing, in [<=1].
+
+        Near 0 means the plot already sits on edges (restraint: leave it); clearly positive
+        means the move found a better-supported position.
+        """
+        return float((self.cost_orig - self.cost) / (self.cost_orig + 1e-6))
 
 
 def rotate_points(pts: np.ndarray, theta: float, cx: float, cy: float) -> np.ndarray:
@@ -52,9 +63,12 @@ def rotate_points(pts: np.ndarray, theta: float, cx: float, cy: float) -> np.nda
     ]) + (cx, cy)
 
 
-def _cost_surface(dt: np.ndarray, cols: np.ndarray, rows: np.ndarray, search: int) -> np.ndarray:
-    """Mean chamfer cost over an integer (dx, dy) grid in [-search, +search]^2.
+def _cost_surface(dt: np.ndarray, cols: np.ndarray, rows: np.ndarray, search: int,
+                  ox: int = 0, oy: int = 0) -> np.ndarray:
+    """Mean chamfer cost over an integer grid in [-search, +search]^2 centred on (ox, oy).
 
+    `(ox, oy)` is the global-offset prior (px); the small window searches residual drift
+    around it. Surface cell (iy, ix) is the cost at shift (ox + ix - search, oy + iy - search).
     Vectorised over the outline points; one fancy-index per candidate shift.
     """
     H, W = dt.shape
@@ -63,9 +77,9 @@ def _cost_surface(dt: np.ndarray, cols: np.ndarray, rows: np.ndarray, search: in
     span = 2 * search + 1
     surf = np.full((span, span), np.inf, np.float32)
     for iy, dy in enumerate(range(-search, search + 1)):
-        rr = np.clip(rows + dy, 0, H - 1)
+        rr = np.clip(rows + oy + dy, 0, H - 1)
         for ix, dx in enumerate(range(-search, search + 1)):
-            cc = np.clip(cols + dx, 0, W - 1)
+            cc = np.clip(cols + ox + dx, 0, W - 1)
             surf[iy, ix] = dt[rr, cc].mean()
     return surf
 
@@ -86,16 +100,21 @@ def _surface_stats(surf: np.ndarray, iy: int, ix: int) -> tuple[float, float]:
 
 
 def align_plot(src, geom4326, boundaries_path, search_m: float, thetas,
+               init_dx_m: float = 0.0, init_dy_m: float = 0.0,
                pad_extra_m: float = 12.0, edge_quantile: float = 0.85) -> AlignResult | None:
     """Rigidly align one plot outline to the local edge field.
 
-    Reads a patch padded to comfortably contain the search window, builds the edge field,
-    and searches (dx, dy) for each theta in `thetas` (radians). Returns the warped geometry
-    plus match-quality diagnostics, or None if the plot can't be read / sampled.
+    `init_dx_m, init_dy_m` are the global-offset prior (metres, patch-pixel convention:
+    +x=col/east, +y=row/south); the search is a small `search_m` window around it. Pass
+    zeros for an unconstrained search. Returns the warped geometry plus match-quality
+    diagnostics (shift measured from the official position, including the prior), or None.
     """
-    patch = patch_for_plot(src, geom4326, pad_m=search_m + pad_extra_m)
+    pad = search_m + max(abs(init_dx_m), abs(init_dy_m)) + pad_extra_m
+    patch = patch_for_plot(src, geom4326, pad_m=pad)
     px_per_m = patch.image.shape[1] / (patch.bounds[2] - patch.bounds[0])  # px per imagery-metre
     search = max(1, int(round(search_m * px_per_m)))
+    ox = int(round(init_dx_m * px_per_m))
+    oy = int(round(init_dy_m * px_per_m))
 
     field_ = _edges.build(patch, boundaries_path, edge_quantile=edge_quantile)
     to_xy, to_ll = transformers(patch)
@@ -104,14 +123,20 @@ def align_plot(src, geom4326, boundaries_path, search_m: float, thetas,
         return None
     cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
 
+    # "do nothing" cost: outline at the official position, no rotation/shift
+    H0, W0 = field_.dt.shape
+    rr0 = np.clip(pts[:, 1].astype(int), 0, H0 - 1)
+    cc0 = np.clip(pts[:, 0].astype(int), 0, W0 - 1)
+    cost_orig = float(field_.dt[rr0, cc0].mean())
+
     best = None  # (cost, dx, dy, theta, surface, iy, ix)
     for th in thetas:
         rot = rotate_points(pts, th, cx, cy)
-        surf = _cost_surface(field_.dt, rot[:, 0], rot[:, 1], search)
+        surf = _cost_surface(field_.dt, rot[:, 0], rot[:, 1], search, ox, oy)
         iy, ix = np.unravel_index(np.argmin(surf), surf.shape)
         cost = float(surf[iy, ix])
         if best is None or cost < best[0]:
-            best = (cost, ix - search, iy - search, th, surf, iy, ix)
+            best = (cost, ox + ix - search, oy + iy - search, th, surf, iy, ix)
 
     cost, dx, dy, theta, surf, iy, ix = best
     prominence, margin = _surface_stats(surf, iy, ix)
@@ -125,28 +150,34 @@ def align_plot(src, geom4326, boundaries_path, search_m: float, thetas,
 
     geom = warp_polygon(geom4326, patch, to_xy, to_ll, dx, dy, theta, cx, cy)
     shift_m = float(np.hypot(dx, dy) / px_per_m)
+    # railed = optimum sits on the edge of the residual search window (no interior minimum)
+    railed = bool(ix in (0, 2 * search) or iy in (0, 2 * search))
 
     return AlignResult(
         geometry=geom, dx=float(dx), dy=float(dy), theta=float(theta), cost=cost,
         px_per_m=px_per_m, prominence=prominence, margin=margin,
-        edge_support=edge_support, shift_m=shift_m, n_points=len(pts), surface=surf,
+        edge_support=edge_support, shift_m=shift_m, cost_orig=cost_orig, railed=railed,
+        n_points=len(pts), surface=surf,
     )
 
 
-def estimate_global_offset(src, plots, boundaries_path, n_sample: int = 120,
-                           search_m: float = 28.0, min_prominence: float = 0.15,
-                           seed: int = 0):
-    """Unsupervised per-village translation: robust median of many translation-only fits.
+def estimate_global_offset(src, plots, boundaries_path, n_sample: int = 180,
+                           search_m: float = 28.0, min_prominence: float = 0.30,
+                           cluster_radius_m: float = 7.0, seed: int = 0):
+    """Unsupervised per-village translation: the centre of the dominant drift cluster.
 
-    Samples `n_sample` plots, aligns each with rotation fixed at 0 over a wide window, keeps
-    the confident locks (prominence above `min_prominence`), and returns the median
-    (dx_m, dy_m) in metres plus the per-sample diagnostics. Never uses example truths.
+    Samples `n_sample` plots, aligns each translation-only over a wide window, and keeps only
+    sharp, non-railed locks (these are the plots whose drift we actually trust). The drift is
+    coherent, so the kept offsets form one dominant cluster plus stragglers that snapped to a
+    neighbouring field; a plain median is pulled by those stragglers. We instead take the mean
+    of the samples within `cluster_radius_m` of the median — the cluster centre. Never uses
+    example truths. Returns (dx_m, dy_m) in patch-pixel convention (+x=east, +y=south).
     """
     rng = np.random.default_rng(seed)
     idx = list(plots.index)
     pick = rng.choice(len(idx), size=min(n_sample, len(idx)), replace=False)
 
-    dxs, dys, kept = [], [], 0
+    offsets = []
     for i in pick:
         pn = idx[i]
         try:
@@ -154,12 +185,14 @@ def estimate_global_offset(src, plots, boundaries_path, n_sample: int = 120,
                            search_m=search_m, thetas=(0.0,))
         except Exception:
             continue
-        if r is None or r.prominence < min_prominence:
+        if r is None or r.railed or r.prominence < min_prominence:
             continue
-        dxs.append(r.dx / r.px_per_m)
-        dys.append(r.dy / r.px_per_m)
-        kept += 1
+        offsets.append((r.dx / r.px_per_m, r.dy / r.px_per_m))
 
-    if kept < 5:
-        raise RuntimeError(f'global offset: only {kept} confident samples — too few to trust')
-    return float(np.median(dxs)), float(np.median(dys)), kept
+    if len(offsets) < 5:
+        raise RuntimeError(f'global offset: only {len(offsets)} confident samples — too few')
+    arr = np.array(offsets)
+    med = np.median(arr, axis=0)
+    keep = np.linalg.norm(arr - med, axis=1) <= cluster_radius_m
+    center = arr[keep].mean(axis=0) if keep.sum() >= 5 else med
+    return float(center[0]), float(center[1]), int(keep.sum())
