@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Large, downloadable data rasters (re-fetch from the Get started page)
+*.tif
+
+# uv cache
+.uv/
