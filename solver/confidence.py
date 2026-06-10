@@ -159,7 +159,7 @@ def heuristic_confidence(res, row) -> float:
 
 
 def decide(res, row, official_geom, model: LogisticModel | None = None,
-           flag_below: float = 0.42, keep_imp: float = 0.05, keep_shift_m: float = 4.0,
+           flag_below: float = 0.42, keep_imp: float = 0.05,
            area_floor: float = 0.45, lost_prom: float = 0.30) -> dict:
     """Turn an AlignResult into a contract decision: status, confidence, geometry, note.
 
@@ -187,9 +187,13 @@ def decide(res, row, official_geom, model: LogisticModel | None = None,
     if res.shift_m > plot_max_shift(row):
         return dict(status='flagged', confidence=None, geometry=official_geom,
                     method_note=f'implausible shift {res.shift_m:.0f}m for plot size — likely wrong field, kept official')
-    if res.improvement_ratio < keep_imp and res.shift_m < keep_shift_m:
+    if res.improvement_ratio < keep_imp:
+        # Aligning barely reduced the chamfer cost: the plot already sits on its edges, so
+        # keep the official geometry even if the search wandered some distance. This is the
+        # restraint guard for already-correct plots (a spurious far minimum that doesn't
+        # actually fit better must not move a correct plot).
         return dict(status='corrected', confidence=round(conf, 3), geometry=official_geom,
-                    method_note=f'already on field edges (shift {res.shift_m:.1f}m) — kept official')
+                    method_note=f'already on field edges (no better fit found) — kept official')
     if conf < flag_below:
         return dict(status='flagged', confidence=None, geometry=official_geom,
                     method_note=f'low alignment confidence {conf:.2f}')

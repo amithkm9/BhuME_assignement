@@ -55,8 +55,22 @@ run from the imagery itself.
 | Vadnerbhairav | **0.874** | 0.612 (**+0.262**) | held-out synthetic AUC 0.99 |
 | Malatavadi | **0.752** | 0.510 (**+0.242**) | example-truth AUC 1.0 |
 
-These run over the few public truths — a directional check, not the grade. The honest calibration
-evidence is the held-out AUC on the self-supervised synthetic set.
+These run over the few public truths — a directional check, not the grade. The honest evidence is
+the validation below, on self-supervised synthetic ground truth.
+
+## Validation (`uv run validate.py data/<village>`)
+
+Because the public truths are only 3–6 plots (and contain no already-correct controls), the real
+evaluation uses confidently-locked plots as pseudo-truths, perturbed by known offsets:
+
+- **Recovery** — given a known offset, the pipeline restores the plot to ~0.93 median IoU, and
+  recovers (IoU≥0.5) up to ~20 m on Vadnerbhairav and ~8–10 m on Malatavadi (beyond which the
+  scale cap correctly *flags* rather than snapping a small plot onto a neighbour).
+- **Calibration** — confidence tracks accuracy: AUC ≈ 0.68–0.70 and Spearman +0.25 (Vadner) /
+  +0.45 (Malatavadi), with a monotonic reliability table (higher confidence → higher mean IoU).
+- **Restraint** — fed an already-correct plot, the pipeline leaves it alone: median shift
+  ~0–1 m, false-shift (>5 m) rate 5–7%. This is the hidden restraint metric, unobservable on the
+  public truths.
 
 ## Repo layout
 
@@ -70,6 +84,7 @@ solver/
   calibrate.py      self-supervised synthetic-perturbation calibration
   pipeline.py       end-to-end orchestration
 bhume/              provided starter-kit plumbing (I/O, CRS, scoring)
+validate.py         recovery curve, calibration reliability, restraint (false-shift) test
 test_align.py       Phase-2 alignment validation
 test_confidence.py  Phase-3 calibration + decision validation
 transcripts/        AI session logs / web-chat links (how the work was directed)
