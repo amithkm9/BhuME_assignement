@@ -21,13 +21,30 @@ from bhume.geo import open_imagery
 
 from .align import align_plot, estimate_global_offset
 from .calibrate import calibrate_village
-from .confidence import decide
+from .confidence import decide, plot_max_shift
 
 THETAS = np.deg2rad(np.arange(-3, 3.01, 1.5))
 
 
-def solve_village(village, refine_m: float = 11.0, global_search_m: float = 28.0,
-                  n_anchors: int = 60, seed: int = 0, verbose: bool = True):
+def _align_adaptive(src, official, row, boundaries_path, gx, gy, refine_m, expand_m):
+    """Align within the small residual window; if it rails, expand once to find the interior
+    minimum — but only as far as the plot's own scale allows, so small dense parcels can't
+    expand onto a neighbouring field (large fields still get the full expansion)."""
+    r = align_plot(src, official, boundaries_path, search_m=refine_m, thetas=THETAS,
+                   init_dx_m=gx, init_dy_m=gy)
+    if r is not None and r.railed:
+        exp = min(expand_m, plot_max_shift(row))
+        if exp > refine_m + 1.0:
+            r2 = align_plot(src, official, boundaries_path, search_m=exp, thetas=THETAS,
+                            init_dx_m=gx, init_dy_m=gy)
+            if r2 is not None:
+                r = r2
+    return r
+
+
+def solve_village(village, refine_m: float = 13.0, expand_m: float = 24.0,
+                  global_search_m: float = 28.0, n_anchors: int = 60, seed: int = 0,
+                  verbose: bool = True):
     """Return (predictions GeoDataFrame, report). Plots that error are omitted (not attempted)."""
     plots = village.plots
     report = {}
@@ -52,9 +69,10 @@ def solve_village(village, refine_m: float = 11.0, global_search_m: float = 28.0
         n_corr = n_flag = n_skip = 0
         for pn in plots.index:
             official = plots.loc[pn, 'geometry']
+            row = plots.loc[pn]
             try:
-                r = align_plot(src, official, village.boundaries_path, search_m=refine_m,
-                               thetas=THETAS, init_dx_m=gx, init_dy_m=gy)
+                r = _align_adaptive(src, official, row, village.boundaries_path, gx, gy,
+                                    refine_m, expand_m)
             except Exception:
                 r = None
             if r is None:

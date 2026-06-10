@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import geopandas as gpd
 import numpy as np
+from scipy.stats import spearmanr
 from shapely.affinity import translate
 
 from .align import align_plot
-from .confidence import LogisticModel, build_features
+from .confidence import RidgeModel, build_features
 
 ACC_IOU = 0.5
 
@@ -90,7 +91,7 @@ def build_dataset(src, plots, boundaries_path, init=(0.0, 0.0), n_anchors=60, se
             if r is None:
                 continue
             X.append(build_features(r, plots.loc[pn]))
-            y.append(_iou_utm(r.geometry, star, utm) >= ACC_IOU)
+            y.append(_iou_utm(r.geometry, star, utm))   # continuous IoU target
     return np.array(X), np.array(y, dtype=float), used
 
 
@@ -99,27 +100,33 @@ def calibrate_village(src, plots, boundaries_path, init=(0.0, 0.0), search_m=11.
     """Fit and return (LogisticModel, report). Report carries held-out AUC and feature weights."""
     X, y, used = build_dataset(src, plots, boundaries_path, init=init, search_m=search_m,
                                n_anchors=n_anchors, seed=seed)
-    report = {'n_samples': len(y), 'n_anchors': used, 'positive_rate': float(y.mean()) if len(y) else None}
-    if len(y) < 20 or len(set(y.tolist())) < 2:
-        report['note'] = 'insufficient/degenerate synthetic data — falling back to heuristic confidence'
+    report = {'n_samples': len(y), 'n_anchors': used,
+              'positive_rate': float((y >= ACC_IOU).mean()) if len(y) else None}
+    if len(y) < 20:
+        report['note'] = 'insufficient synthetic data — falling back to heuristic confidence'
         return None, report
 
-    # held-out AUC: 70/30 split
+    # held-out ranking quality on a 70/30 split: does predicted IoU track actual IoU?
     rng = np.random.default_rng(seed + 1)
     perm = rng.permutation(len(y))
     cut = int(0.7 * len(y))
     tr, te = perm[:cut], perm[cut:]
-    holdout_auc = None
-    if len(set(y[te].tolist())) == 2 and len(set(y[tr].tolist())) == 2:
-        m_cv = LogisticModel().fit(X[tr], y[tr])
-        holdout_auc = auc(m_cv.predict(X[te]).tolist(), y[te].tolist())
+    holdout_auc = holdout_spearman = None
+    if len(te) >= 5 and len(set((y[tr] >= ACC_IOU).tolist())) == 2:
+        pred_te = RidgeModel().fit(X[tr], y[tr]).predict(X[te])
+        if len(set((y[te] >= ACC_IOU).tolist())) == 2:
+            holdout_auc = auc(pred_te.tolist(), (y[te] >= ACC_IOU).tolist())
+        if len(set(pred_te.tolist())) > 1 and len(set(y[te].tolist())) > 1:
+            holdout_spearman = round(float(spearmanr(pred_te, y[te]).correlation), 3)
     report['holdout_auc'] = holdout_auc
+    report['holdout_spearman'] = holdout_spearman
 
-    model = LogisticModel().fit(X, y)
+    model = RidgeModel().fit(X, y)
     report['weights'] = model.weights()
     if verbose:
         print(f'  synthetic: {report["n_samples"]} samples from {used} anchors, '
-              f'positive_rate={report["positive_rate"]:.2f}, holdout_AUC='
-              f'{holdout_auc if holdout_auc is None else round(holdout_auc, 3)}')
+              f'IoU>=.5 rate={report["positive_rate"]:.2f}, holdout_AUC='
+              f'{holdout_auc if holdout_auc is None else round(holdout_auc, 3)}, '
+              f'holdout_Spearman={holdout_spearman}')
         print('  feature weights:', {k: round(v, 2) for k, v in report['weights'].items()})
     return model, report
